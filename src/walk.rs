@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::mem;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -13,6 +13,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender, bounded};
 use etcetera::BaseStrategy;
 use ignore::overrides::{Override, OverrideBuilder};
 use ignore::{WalkBuilder, WalkParallel, WalkState};
+use normpath::PathExt;
 use regex::bytes::Regex;
 
 use crate::config::Config;
@@ -667,6 +668,42 @@ fn is_broken_symlink(path: &Path, err: &ignore::Error) -> bool {
             .is_some_and(|m| m.file_type().is_symlink())
 }
 
+/// Collapse `.` and `..` path components. This stays purely lexical (no
+/// filesystem access, so no symlink is resolved) *except* when the component
+/// a `..` would pop is itself a symlink: lexically popping it would disagree
+/// with the OS, since e.g. `symlink_dir/..` resolves relative to the
+/// symlink's real location, not to its parent directory. That's rare enough
+/// (nearly every `..` pops a real directory name found during the walk, not
+/// the symlink itself) that checking costs one extra `symlink_metadata` call
+/// only on a `..` component, not per entry, and only resolves that one
+/// component rather than the whole path. A leading `..` that can't be popped
+/// (there's nothing above it in `path`) is kept as-is.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let is_symlink = out
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink());
+                if is_symlink
+                    && let Ok(resolved) = out.normalize()
+                {
+                    out = resolved.into_path_buf();
+                    out.pop();
+                    continue;
+                }
+                if !out.pop() {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn search_str_for_entry<'a>(
     entry_path: &'a std::path::Path,
     full_path_base: Option<&std::path::Path>,
@@ -674,11 +711,27 @@ fn search_str_for_entry<'a>(
     if let Some(cwd) = full_path_base {
         // If full_path_base is some, that means that we need to return
         // the absolute path
-        if entry_path.is_absolute() {
-            return Cow::Borrowed(entry_path.as_os_str());
+        let path = if entry_path.is_absolute() {
+            Cow::Borrowed(entry_path)
+        } else {
+            let path = entry_path.strip_prefix(".").unwrap_or(entry_path);
+            Cow::Owned(cwd.join(path))
+        };
+        // Collapse `..` components (e.g. from a search path like `..`) lexically,
+        // so the result doesn't contain a literal `..`, matching `--absolute-path`
+        // (which only resolves the search root once). This must not touch the
+        // filesystem: `--absolute-path` never re-resolves symlinks found during
+        // the walk, only the root search path, and doing a per-entry
+        // `fs::canonicalize` here was both ~4x slower on `..` searches and
+        // resolved symlinked directories to their target name instead of the
+        // link name, disagreeing with `--absolute-path` and with `-L`.
+        if path.components().any(|c| c == Component::ParentDir) {
+            return Cow::Owned(normalize_lexically(&path).into());
         }
-        let path = entry_path.strip_prefix(".").unwrap_or(entry_path);
-        Cow::Owned(cwd.join(path).into())
+        match path {
+            Cow::Borrowed(p) => Cow::Borrowed(p.as_os_str()),
+            Cow::Owned(p) => Cow::Owned(p.into()),
+        }
     } else {
         match entry_path.file_name() {
             Some(filename) => Cow::Borrowed(filename),

@@ -7,6 +7,7 @@
 - Accept `--format` templates that start with `-` when passed as a separate argument, see #2126 (@vulragrag-star)
 - Don't incorrectly escape newlines in error messages, see #2104
 - Restore jemalloc as default allocator on supported systems
+- Resolve `..` components in search paths when matching with `--full-path`, so results no longer differ from `--absolute-path`, see #1513
 
 # 10.5.0
 
