@@ -1,10 +1,11 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::mem;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender, bounded};
 use etcetera::BaseStrategy;
 use ignore::overrides::{Override, OverrideBuilder};
 use ignore::{WalkBuilder, WalkParallel, WalkState};
+use normpath::PathExt;
 use regex::bytes::Regex;
 
 use crate::config::Config;
@@ -483,25 +485,15 @@ impl WorkerState {
                 }
                 let entry = match entry {
                     Ok(e) => DirEntry::normal(e),
-                    Err(err) => {
-                        // The depth has to be read off the error before it is
-                        // taken apart, since it is recorded on an inner variant.
-                        let depth = err.depth();
-                        match err {
-                            ignore::Error::WithPath {
-                                path,
-                                err: inner_err,
-                            } if is_broken_symlink(&path, &inner_err) => {
-                                DirEntry::broken_symlink(path, depth)
-                            }
-                            err => {
-                                return match tx.send(WorkerResult::Error(err)) {
-                                    Ok(_) => WalkState::Continue,
-                                    Err(_) => WalkState::Quit,
-                                };
-                            }
+                    Err(err) => match broken_symlink_from_err(err) {
+                        Ok(entry) => entry,
+                        Err(err) => {
+                            return match tx.send(WorkerResult::Error(err)) {
+                                Ok(_) => WalkState::Continue,
+                                Err(_) => WalkState::Quit,
+                            };
                         }
-                    }
+                    },
                 };
 
                 if let Some(min_depth) = config.min_depth
@@ -652,19 +644,107 @@ impl WorkerState {
     }
 }
 
-/// Whether a walk error is really a broken symlink rather than a failure worth
-/// reporting.
-///
-/// A symlink whose target is missing is surfaced by the walker as a NotFound
-/// error against the link's own path, so it never arrives as an entry. fd still
-/// wants to match and print it (see issue #1017), which means recovering it here.
-fn is_broken_symlink(path: &Path, err: &ignore::Error) -> bool {
-    err.io_error()
-        .is_some_and(|io_error| io_error.kind() == io::ErrorKind::NotFound)
-        && path
-            .symlink_metadata()
-            .ok()
-            .is_some_and(|m| m.file_type().is_symlink())
+/// If `err` is for a broken symlink, create a broken symlink DirEntry,
+/// otherwise, return the original error.
+fn broken_symlink_from_err(mut err: ignore::Error) -> Result<DirEntry, ignore::Error> {
+    use ignore::Error::*;
+    let mut depth = None;
+    let mut path = None;
+    let mut current = &mut err;
+    // Loop through the items in the chain, and extract the path and depth as we find them.
+    // Then once we get to the (terminal) io error, check that it is for a broken symlink.
+    loop {
+        match current {
+            WithPath { err, path: p } => {
+                path = Some(p);
+                current = err;
+            }
+            WithDepth { err, depth: d } => {
+                depth = Some(*d);
+                current = err;
+            }
+            Io(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(path) = path
+                    && path
+                        .symlink_metadata()
+                        .ok()
+                        .is_some_and(|m| m.file_type().is_symlink())
+                {
+                    // Since we no longer need the original error, we can take the PathBuf of the
+                    // path out of it.
+                    return Ok(DirEntry::broken_symlink(mem::take(path), depth));
+                } else {
+                    // This is pretty unlikely.
+                    return Err(err);
+                }
+            }
+            // We don't care about Loop because that won't happen
+            // for broken symlinks, and there are two paths involved
+            // and we don't care about WithLineNumber because that only applies
+            // to errors while parsing ignore files.
+            _ => return Err(err),
+        }
+    }
+}
+
+/// Caches the per-component resolution `normalize_lexically` does when a
+/// `..` pops a symlink. The prefix being popped at that point is the same
+/// path for every entry under a given search root: it comes from the search
+/// path itself (e.g. `blink/..`), not from anything the walk discovers, so
+/// the `symlink_metadata`/canonicalize call was being repeated, unchanged,
+/// once per entry. On a large tree that's measurable, and on Windows (where
+/// those calls are far more expensive) it was seconds rather than
+/// milliseconds; see the benchmarks on PR #2149. The number of distinct
+/// prefixes ever looked up in one run is tiny (one per `..`-containing
+/// search path in practice), so a plain `HashMap` behind a `Mutex` is enough.
+fn symlink_pop_cache() -> &'static Mutex<HashMap<PathBuf, Option<PathBuf>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<PathBuf>>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Collapse `.` and `..` path components. This stays purely lexical (no
+/// filesystem access, so no symlink is resolved) *except* when the component
+/// a `..` would pop is itself a symlink: lexically popping it would disagree
+/// with the OS, since e.g. `symlink_dir/..` resolves relative to the
+/// symlink's real location, not to its parent directory. That's rare enough
+/// (nearly every `..` pops a real directory name found during the walk, not
+/// the symlink itself) that checking costs one `symlink_metadata` call per
+/// distinct popped prefix, not per entry (see `symlink_pop_cache`), and only
+/// resolves that one component rather than the whole path. A leading `..`
+/// that can't be popped (there's nothing above it in `path`) is kept as-is.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let resolved = symlink_pop_cache()
+                    .lock()
+                    .unwrap()
+                    .entry(out.clone())
+                    .or_insert_with(|| {
+                        let is_symlink = out
+                            .symlink_metadata()
+                            .is_ok_and(|m| m.file_type().is_symlink());
+                        is_symlink
+                            .then(|| out.normalize().ok())
+                            .flatten()
+                            .map(|n| n.into_path_buf())
+                    })
+                    .clone();
+                if let Some(resolved) = resolved {
+                    out = resolved;
+                    out.pop();
+                    continue;
+                }
+                if !out.pop() {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn search_str_for_entry<'a>(
@@ -674,11 +754,27 @@ fn search_str_for_entry<'a>(
     if let Some(cwd) = full_path_base {
         // If full_path_base is some, that means that we need to return
         // the absolute path
-        if entry_path.is_absolute() {
-            return Cow::Borrowed(entry_path.as_os_str());
+        let path = if entry_path.is_absolute() {
+            Cow::Borrowed(entry_path)
+        } else {
+            let path = entry_path.strip_prefix(".").unwrap_or(entry_path);
+            Cow::Owned(cwd.join(path))
+        };
+        // Collapse `..` components (e.g. from a search path like `..`) lexically,
+        // so the result doesn't contain a literal `..`, matching `--absolute-path`
+        // (which only resolves the search root once). This must not touch the
+        // filesystem: `--absolute-path` never re-resolves symlinks found during
+        // the walk, only the root search path, and doing a per-entry
+        // `fs::canonicalize` here was both ~4x slower on `..` searches and
+        // resolved symlinked directories to their target name instead of the
+        // link name, disagreeing with `--absolute-path` and with `-L`.
+        if path.components().any(|c| c == Component::ParentDir) {
+            return Cow::Owned(normalize_lexically(&path).into());
         }
-        let path = entry_path.strip_prefix(".").unwrap_or(entry_path);
-        Cow::Owned(cwd.join(path).into())
+        match path {
+            Cow::Borrowed(p) => Cow::Borrowed(p.as_os_str()),
+            Cow::Owned(p) => Cow::Owned(p.into()),
+        }
     } else {
         match entry_path.file_name() {
             Some(filename) => Cow::Borrowed(filename),
