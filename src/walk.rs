@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::mem;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -13,6 +13,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender, bounded};
 use etcetera::BaseStrategy;
 use ignore::overrides::{Override, OverrideBuilder};
 use ignore::{WalkBuilder, WalkParallel, WalkState};
+use normpath::PathExt;
 use regex::bytes::Regex;
 
 use crate::config::Config;
@@ -311,6 +312,9 @@ struct WorkerState {
     quit_flag: Arc<AtomicBool>,
     /// Flag specifically for quitting due to ^C
     interrupt_flag: Arc<AtomicBool>,
+    /// Search roots containing a `..` (as joined onto `full_path_base`), paired with their
+    /// normalized form. Only filled for `--full-path`.
+    resolved_roots: Vec<(PathBuf, PathBuf)>,
 }
 
 impl WorkerState {
@@ -323,7 +327,25 @@ impl WorkerState {
             config,
             quit_flag,
             interrupt_flag,
+            resolved_roots: Vec::new(),
         }
+    }
+
+    /// A `..` in a path can only come from a search root, never from the walk itself, so
+    /// normalize each such root once here instead of once per entry.
+    fn resolve_search_roots(&mut self, paths: &[PathBuf]) {
+        let Some(cwd) = self.config.full_path_base.as_deref() else {
+            return;
+        };
+        self.resolved_roots = paths
+            .iter()
+            .map(|path| absolute_search_path(path, cwd))
+            .filter(|path| path.components().any(|c| c == Component::ParentDir))
+            .map(|path| {
+                let normalized = normalize_lexically(&path);
+                (path, normalized)
+            })
+            .collect();
     }
 
     fn build_overrides(&self, paths: &[PathBuf]) -> Result<Override> {
@@ -443,6 +465,7 @@ impl WorkerState {
         walker.run(|| {
             let patterns = &self.patterns;
             let config = &self.config;
+            let resolved_roots = self.resolved_roots.as_slice();
             let quit_flag = self.quit_flag.as_ref();
 
             let mut limit = 0x100;
@@ -483,25 +506,15 @@ impl WorkerState {
                 }
                 let entry = match entry {
                     Ok(e) => DirEntry::normal(e),
-                    Err(err) => {
-                        // The depth has to be read off the error before it is
-                        // taken apart, since it is recorded on an inner variant.
-                        let depth = err.depth();
-                        match err {
-                            ignore::Error::WithPath {
-                                path,
-                                err: inner_err,
-                            } if is_broken_symlink(&path, &inner_err) => {
-                                DirEntry::broken_symlink(path, depth)
-                            }
-                            err => {
-                                return match tx.send(WorkerResult::Error(err)) {
-                                    Ok(_) => WalkState::Continue,
-                                    Err(_) => WalkState::Quit,
-                                };
-                            }
+                    Err(err) => match broken_symlink_from_err(err) {
+                        Ok(entry) => entry,
+                        Err(err) => {
+                            return match tx.send(WorkerResult::Error(err)) {
+                                Ok(_) => WalkState::Continue,
+                                Err(_) => WalkState::Quit,
+                            };
                         }
-                    }
+                    },
                 };
 
                 if let Some(min_depth) = config.min_depth
@@ -513,7 +526,11 @@ impl WorkerState {
                 // Check the name first, since it doesn't require metadata
                 let entry_path = entry.path();
 
-                let search_str = search_str_for_entry(entry_path, config.full_path_base.as_deref());
+                let search_str = search_str_for_entry(
+                    entry_path,
+                    config.full_path_base.as_deref(),
+                    resolved_roots,
+                );
 
                 if !patterns
                     .iter()
@@ -652,33 +669,127 @@ impl WorkerState {
     }
 }
 
-/// Whether a walk error is really a broken symlink rather than a failure worth
-/// reporting.
-///
-/// A symlink whose target is missing is surfaced by the walker as a NotFound
-/// error against the link's own path, so it never arrives as an entry. fd still
-/// wants to match and print it (see issue #1017), which means recovering it here.
-fn is_broken_symlink(path: &Path, err: &ignore::Error) -> bool {
-    err.io_error()
-        .is_some_and(|io_error| io_error.kind() == io::ErrorKind::NotFound)
-        && path
-            .symlink_metadata()
-            .ok()
-            .is_some_and(|m| m.file_type().is_symlink())
+/// If `err` is for a broken symlink, create a broken symlink DirEntry,
+/// otherwise, return the original error.
+fn broken_symlink_from_err(mut err: ignore::Error) -> Result<DirEntry, ignore::Error> {
+    use ignore::Error::*;
+    let mut depth = None;
+    let mut path = None;
+    let mut current = &mut err;
+    // Loop through the items in the chain, and extract the path and depth as we find them.
+    // Then once we get to the (terminal) io error, check that it is for a broken symlink.
+    loop {
+        match current {
+            WithPath { err, path: p } => {
+                path = Some(p);
+                current = err;
+            }
+            WithDepth { err, depth: d } => {
+                depth = Some(*d);
+                current = err;
+            }
+            Io(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(path) = path
+                    && path
+                        .symlink_metadata()
+                        .ok()
+                        .is_some_and(|m| m.file_type().is_symlink())
+                {
+                    // Since we no longer need the original error, we can take the PathBuf of the
+                    // path out of it.
+                    return Ok(DirEntry::broken_symlink(mem::take(path), depth));
+                } else {
+                    // This is pretty unlikely.
+                    return Err(err);
+                }
+            }
+            // We don't care about Loop because that won't happen
+            // for broken symlinks, and there are two paths involved
+            // and we don't care about WithLineNumber because that only applies
+            // to errors while parsing ignore files.
+            _ => return Err(err),
+        }
+    }
+}
+
+/// Join a search path onto `cwd` the way `search_str_for_entry` does for its entries.
+fn absolute_search_path(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path.strip_prefix(".").unwrap_or(path))
+    }
+}
+
+/// Collapse `.` and `..` path components. This stays purely lexical (no
+/// filesystem access, so no symlink is resolved) *except* when the component
+/// a `..` would pop is itself a symlink: lexically popping it would disagree
+/// with the OS, since e.g. `symlink_dir/..` resolves relative to the
+/// symlink's real location, not to its parent directory. Only that one
+/// component is resolved, not the whole path. A leading `..` that can't be
+/// popped (there's nothing above it in `path`) is kept as-is.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let is_symlink = out
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink());
+                if let Some(resolved) = is_symlink.then(|| out.normalize().ok()).flatten() {
+                    out = resolved.into_path_buf();
+                    out.pop();
+                    continue;
+                }
+                if !out.pop() {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn search_str_for_entry<'a>(
     entry_path: &'a std::path::Path,
     full_path_base: Option<&std::path::Path>,
+    resolved_roots: &[(PathBuf, PathBuf)],
 ) -> Cow<'a, OsStr> {
     if let Some(cwd) = full_path_base {
         // If full_path_base is some, that means that we need to return
         // the absolute path
-        if entry_path.is_absolute() {
-            return Cow::Borrowed(entry_path.as_os_str());
+        let path = if entry_path.is_absolute() {
+            Cow::Borrowed(entry_path)
+        } else {
+            let path = entry_path.strip_prefix(".").unwrap_or(entry_path);
+            Cow::Owned(cwd.join(path))
+        };
+        // Collapse `..` components (e.g. from a search path like `..`), so the result
+        // doesn't contain a literal `..`, matching `--absolute-path` (which only resolves
+        // the search root once). A `..` can only come from the search root, so replace that
+        // root by its already-normalized form instead of normalizing every entry. This
+        // must not re-resolve symlinks found during the walk: `--absolute-path` never does.
+        if path.components().any(|c| c == Component::ParentDir) {
+            let root = resolved_roots
+                .iter()
+                .filter(|(root, _)| path.starts_with(root))
+                .max_by_key(|(root, _)| root.components().count());
+            let normalized = match root {
+                Some((root, normalized)) => match path.strip_prefix(root) {
+                    Ok(rest) if rest.as_os_str().is_empty() => normalized.clone(),
+                    Ok(rest) => normalized.join(rest),
+                    Err(_) => normalize_lexically(&path),
+                },
+                None => normalize_lexically(&path),
+            };
+            return Cow::Owned(normalized.into());
         }
-        let path = entry_path.strip_prefix(".").unwrap_or(entry_path);
-        Cow::Owned(cwd.join(path).into())
+        match path {
+            Cow::Borrowed(p) => Cow::Borrowed(p.as_os_str()),
+            Cow::Owned(p) => Cow::Owned(p.into()),
+        }
     } else {
         match entry_path.file_name() {
             Some(filename) => Cow::Borrowed(filename),
@@ -697,7 +808,9 @@ fn search_str_for_entry<'a>(
 /// jobs in parallel from a given command line and the discovered paths. Otherwise, each
 /// path will simply be written to standard output.
 pub fn scan(paths: &[PathBuf], patterns: Vec<Regex>, config: Config) -> Result<ExitCode> {
-    WorkerState::new(patterns, config).scan(paths)
+    let mut state = WorkerState::new(patterns, config);
+    state.resolve_search_roots(paths);
+    state.scan(paths)
 }
 
 #[cfg(test)]
@@ -709,7 +822,7 @@ mod tests {
     fn search_str_for_entry_with_relative_path() {
         let full_path_base = Some(Path::new("/home/user"));
         assert_eq!(
-            search_str_for_entry(Path::new("foo/bar"), full_path_base),
+            search_str_for_entry(Path::new("foo/bar"), full_path_base, &[]),
             PathBuf::from("/home/user/foo/bar")
         );
     }
@@ -718,7 +831,7 @@ mod tests {
     fn search_str_for_entry_strips_dot_prefix() {
         let full_path_base = Some(Path::new("/home/user"));
         assert_eq!(
-            search_str_for_entry(Path::new("./foo/bar"), full_path_base),
+            search_str_for_entry(Path::new("./foo/bar"), full_path_base, &[]),
             PathBuf::from("/home/user/foo/bar")
         );
     }
@@ -727,7 +840,7 @@ mod tests {
     fn search_str_for_entry_with_absolute_path() {
         let full_path_base = Some(Path::new("/home/user"));
         assert_eq!(
-            search_str_for_entry(Path::new("/absolute/path"), full_path_base),
+            search_str_for_entry(Path::new("/absolute/path"), full_path_base, &[]),
             PathBuf::from("/absolute/path")
         );
     }
@@ -735,7 +848,7 @@ mod tests {
     #[test]
     fn search_str_no_base_dir() {
         assert_eq!(
-            search_str_for_entry(Path::new("./foo/bar"), None),
+            search_str_for_entry(Path::new("./foo/bar"), None, &[]),
             PathBuf::from("bar")
         );
     }
@@ -743,7 +856,7 @@ mod tests {
     #[test]
     fn search_str_no_base_dir_with_plain_relative_path() {
         assert_eq!(
-            search_str_for_entry(Path::new("foo/bar"), None),
+            search_str_for_entry(Path::new("foo/bar"), None, &[]),
             PathBuf::from("bar")
         );
     }
@@ -751,7 +864,7 @@ mod tests {
     #[test]
     fn search_str_no_base_dir_with_file_in_current_dir() {
         assert_eq!(
-            search_str_for_entry(Path::new("foo"), None),
+            search_str_for_entry(Path::new("foo"), None, &[]),
             PathBuf::from("foo")
         );
     }
